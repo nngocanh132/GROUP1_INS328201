@@ -48,15 +48,19 @@ If the repository has already been cloned, skip this step and open the existing 
 
 ### Step 3: Configure the Project Directory
 
-Copy or clone the project into the XAMPP `htdocs` directory.
+The repository contains the project folder:
 
-The project directory should be:
+vinamilk_contract_and_document_management_system
 
-```text
+For local development with XAMPP, place the project folder inside the htdocs directory.
+
+The expected project path is:
+
 C:\xampp\htdocs\vinamilk_contract_and_document_management_system
-```
 
-If the repository was cloned elsewhere, move the project folder into `htdocs` before running it locally.
+If the repository is cloned directly into C:\xampp\htdocs, the project folder will be nested inside GROUP1_INS328201. In that case, move the inner project folder into htdocs or adjust the setup instructions to match the actual directory structure.
+
+Start Apache and MySQL from the XAMPP Control Panel before running the application.
 
 ### Step 4: Start XAMPP
 
