@@ -40,11 +40,11 @@ Open the XAMPP Control Panel and ensure that Apache and MySQL are available.
 Open Git Bash or the VS Code terminal and run:
 
 ```bash
-git clone <repository-url>
-cd vinamilk_contract_and_document_management_system
+git clone https://github.com/nngocanh132/GROUP1_INS328201.git
+cd GROUP1_INS328201
 ```
 
-Replace `<repository-url>` with the actual GitHub repository URL.
+If the repository has already been cloned, skip this step and open the existing project folder.
 
 ### Step 3: Configure the Project Directory
 
