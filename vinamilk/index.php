@@ -608,7 +608,7 @@ include __DIR__ . '/includes/layout_head.php';
       <?php if (empty($monthly_rows)): ?>
       <div class="chart-empty">No monthly data available.</div>
       <?php else: ?>
-      <canvas id="chartMonthly" height="150"></canvas>
+      <canvas id="chartMonthly"></canvas>
       <?php endif; ?>
     </div>
   </div>
