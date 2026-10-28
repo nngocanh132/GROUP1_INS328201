@@ -51,18 +51,20 @@ $breadcrumbs = $breadcrumbs ?? [];
            EXTERNAL (PARTNER) SIDEBAR
            ================================================ -->
       <?php
-      // Compute pending proposal count for this partner
-      $ext_pending_proposals = 0;
+      // Compute pending proposal count for this partner's sidebar badge.
+      // Uses a distinct variable name (_sidebar_) to avoid clobbering any
+      // $ext_pending_proposals array already set by the calling page (index.php).
+      $sidebar_ext_pending_proposals = 0;
       try {
-          $ext_cp_id = (int) db_query(
+          $sidebar_ext_cp_id = (int) db_query(
               "SELECT CounterpartyID FROM Contact WHERE AccountID = ? LIMIT 1",
               [$user['account_id']]
           )->fetchColumn();
-          if ($ext_cp_id && db_table_exists('ContractProposal')) {
-              $ext_pending_proposals = (int) db_query(
+          if ($sidebar_ext_cp_id && db_table_exists('ContractProposal')) {
+              $sidebar_ext_pending_proposals = (int) db_query(
                   "SELECT COUNT(*) FROM ContractProposal
                    WHERE CounterpartyID = ? AND Status = 'Pending'",
-                  [$ext_cp_id]
+                  [$sidebar_ext_cp_id]
               )->fetchColumn();
           }
       } catch (Throwable) {}
@@ -82,10 +84,10 @@ $breadcrumbs = $breadcrumbs ?? [];
            class="nav-item <?= $active_nav === 'partner_portal' ? 'active' : '' ?>">
           <?= icon_svg('file-plus') ?>
           Contract Proposals
-          <?php if ($ext_pending_proposals > 0): ?>
+          <?php if ($sidebar_ext_pending_proposals > 0): ?>
           <span style="margin-left:auto;background:var(--color-warning,#d97706);color:#fff;
                        font-size:10px;font-weight:700;border-radius:10px;padding:1px 6px;
-                       min-width:18px;text-align:center;"><?= $ext_pending_proposals ?></span>
+                       min-width:18px;text-align:center;"><?= $sidebar_ext_pending_proposals ?></span>
           <?php endif; ?>
         </a>
         <a href="<?= BASE_URL ?>/pages/contracts.php"
@@ -294,9 +296,8 @@ $breadcrumbs = $breadcrumbs ?? [];
           )->fetchColumn();
       } catch (Throwable) {}
       ?>
-      <a href="<?= $user['role'] === 'external' ? BASE_URL . '/pages/partner_portal.php' : BASE_URL . '/pages/approvals.php' ?>"
-         class="icon-btn" aria-label="Notifications">
-        <?= icon_svg('bell') ?>
+      <a href="<?= BASE_URL ?>/pages/notifications.php"
+         class="icon-btn" aria-label="Notifications"><?= icon_svg('bell') ?>
         <?php if ($unread_count > 0): ?>
         <span class="notif-dot"></span>
         <?php endif; ?>
