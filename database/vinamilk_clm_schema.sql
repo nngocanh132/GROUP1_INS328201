@@ -19,6 +19,9 @@ CREATE DATABASE IF NOT EXISTS vinamilk_clm
 
 USE vinamilk_clm;
 
+
+
+
 -- If you need to rebuild from scratch, back up your data first.
 -- Then drop tables manually in reverse dependency order.
 
