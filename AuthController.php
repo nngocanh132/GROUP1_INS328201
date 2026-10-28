@@ -77,3 +77,31 @@ class AuthController
                 'remember' => $remember,
             ];
         }
+
+    
+        if ($row['Status'] !== 'Active') {
+            return [
+                'error'    => 'Your account is not active. Please contact the system administrator.',
+                'email'    => $email,
+                'remember' => $remember,
+            ];
+        }
+
+        if (!password_verify($password, $row['PasswordHash'])) {
+            audit('LOGIN_FAILED', 'Account', null, ['email' => $email]);
+            return [
+                'error'    => 'Invalid email or password. Please try again.',
+                'email'    => $email,
+                'remember' => $remember,
+            ];
+        }
+
+        // ── Success: log in and redirect ──────────────────────
+        login_user($row);
+        $this->model->updateLastLogin($row['AccountID']);
+        audit('LOGIN', 'Account', $row['AccountID'], ['role' => $row['RoleName']]);
+
+        header('Location: ' . BASE_URL . '/index.php');
+        exit;
+    }
+}
