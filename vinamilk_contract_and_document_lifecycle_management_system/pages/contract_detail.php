@@ -1,13 +1,257 @@
 <?php
 /**
- * Contract Detail View (MVC)
- * Variables provided by ContractController::show():
- *   $user, $contract, $documents, $history, $reviews, $approvals
- *   $is_owner, $my_pending_review, $pending_approval
- *   $show_submit_for_review, $show_complete_review, $show_approve_link, $show_set_active
- *   $page_title, $active_nav, $breadcrumbs
+ * Contract Detail page
+ *
+ * Workflow action buttons by role and contract status:
+ *
+ *   Staff (owner of contract):
+ *     Draft             → "Submit for Review" button
+ *     RevisionRequested → "Resubmit for Review" button
+ *
+ *   Staff/Admin (Legal reviewer assigned to this contract):
+ *     PendingReview     → "Complete Review" button (opens modal)
+ *
+ *   Admin:
+ *     PendingReview or PendingApproval → "Review & Approve" link to approvals.php
+ *     PendingApproval  → inline "Approve / Reject" form
+ *
+ *   All internal:
+ *     Approved          → "Set Active" button (admin only)
  */
-include __DIR__ . '/../../../includes/layout_head.php';
+require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/helpers.php';
+
+require_login();
+$user = current_user();
+
+$id = (int)($_GET['id'] ?? 0);
+if (!$id) {
+    redirect_with_flash(BASE_URL . '/pages/contracts.php', 'danger', 'No contract ID specified.');
+}
+
+// ---------------------------------------------------------------
+// Handle POST workflow actions
+// ---------------------------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!verify_csrf()) {
+        redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger', 'Security token mismatch.');
+    }
+
+    $post_action = trim($_POST['post_action'] ?? '');
+
+    // ---- Staff: submit draft for review ----
+    if ($post_action === 'submit_for_review') {
+        $contract = db_query("SELECT * FROM Contract WHERE ContractID=?", [$id])->fetch();
+        if (!$contract || !in_array($contract['Status'], ['Draft', 'RevisionRequested'])) {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger',
+                'Contract cannot be submitted for review at this stage.');
+        }
+        // Verify the user is the owner or admin
+        $owner_acc = db_query("SELECT AccountID FROM Staff WHERE StaffID=?", [$contract['OwnerStaffID']])->fetchColumn();
+        if ($user['role'] !== 'admin' && (int)$owner_acc !== (int)$user['account_id']) {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger', 'Access denied.');
+        }
+
+        // Validate required fields for submission
+        if (!$contract['StartDate'] || !$contract['EndDate']) {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger',
+                'Contract must have Start Date and End Date before it can be submitted for review.');
+        }
+        if (!$contract['Summary']) {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger',
+                'Contract must have a Summary before it can be submitted for review.');
+        }
+
+        $db = get_db();
+        $db->beginTransaction();
+        try {
+            $old_status = $contract['Status'];
+            db_query("UPDATE Contract SET Status='PendingReview', UpdatedAt=NOW() WHERE ContractID=?", [$id]);
+            record_status_change($id, $user['account_id'], $old_status, 'PendingReview', 'Submitted for legal review');
+
+            // Find legal reviewer (Legal dept staff, not the owner)
+            $legal_reviewer = db_query(
+                "SELECT a.AccountID FROM Staff s
+                 JOIN Account a ON a.AccountID=s.AccountID
+                 JOIN Role r ON r.RoleID=a.RoleID
+                 JOIN Department d ON d.DepartmentID=s.DepartmentID
+                 WHERE d.DepartmentName='Legal' AND a.Status='Active'
+                   AND r.RoleName IN ('Manager/Admin','Staff') AND s.StaffID!=?
+                 ORDER BY r.RoleID DESC, s.StaffID ASC LIMIT 1",
+                [$contract['OwnerStaffID']]
+            )->fetchColumn();
+
+            if (!$legal_reviewer) {
+                $legal_reviewer = db_query(
+                    "SELECT a.AccountID FROM Account a JOIN Role r ON r.RoleID=a.RoleID
+                     WHERE r.RoleName='Manager/Admin' AND a.Status='Active' LIMIT 1"
+                )->fetchColumn();
+            }
+
+            // Cancel old pending reviews and create a fresh one
+            db_query("UPDATE Review SET ReviewStatus='Rejected', Comments='Superseded by resubmission', ReviewedAt=NOW()
+                      WHERE ContractID=? AND ReviewStatus='Pending'", [$id]);
+
+            if ($legal_reviewer) {
+                db_query("INSERT INTO Review (ContractID, ReviewerAccountID, ReviewStatus, SubmittedAt) VALUES (?,?,'Pending',NOW())",
+                    [$id, $legal_reviewer]);
+                db_query("INSERT INTO Notification (AccountID, ContractID, Title, Message, NotificationType, IsRead, CreatedAt)
+                          VALUES (?,?,?,?,'Info',0,NOW())",
+                    [$legal_reviewer, $id, 'Contract submitted for legal review',
+                     "Contract {$contract['ContractCode']} has been submitted for legal review."]);
+            }
+
+            // Create or update ContractRequest
+            $existing_req = db_query(
+                "SELECT RequestID FROM ContractRequest WHERE ContractID=? AND RequestType='InternalApproval' AND Status='InProgress'",
+                [$id]
+            )->fetchColumn();
+            if (!$existing_req) {
+                db_query(
+                    "INSERT INTO ContractRequest (ContractID, RequestedBy, RequestType, AssignedSide, Status, Description, RequestedAt)
+                     VALUES (?,?,'InternalApproval','Internal','InProgress',?,NOW())",
+                    [$id, $user['account_id'], 'Contract resubmitted for review and approval: ' . $contract['ContractTitle']]
+                );
+            }
+
+            $db->commit();
+            audit('SUBMIT_FOR_REVIEW', 'Contract', $id, ['from' => $old_status]);
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'success',
+                'Contract submitted for legal review.');
+        } catch (Throwable $e) {
+            $db->rollBack();
+            error_log('submit_for_review error: ' . $e->getMessage());
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger',
+                'An error occurred: ' . $e->getMessage());
+        }
+    }
+
+    // ---- Admin: set contract Active ----
+    elseif ($post_action === 'set_active') {
+        if ($user['role'] !== 'admin') {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger', 'Access denied.');
+        }
+        $contract = db_query("SELECT Status FROM Contract WHERE ContractID=?", [$id])->fetch();
+        if (!$contract || $contract['Status'] !== 'Approved') {
+            redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'danger',
+                'Only Approved contracts can be set to Active.');
+        }
+        db_query("UPDATE Contract SET Status='Active', UpdatedAt=NOW() WHERE ContractID=?", [$id]);
+        record_status_change($id, $user['account_id'], 'Approved', 'Active', 'Manually activated by admin');
+        audit('SET_ACTIVE', 'Contract', $id, []);
+        redirect_with_flash(BASE_URL . '/pages/contract_detail.php?id=' . $id, 'success', 'Contract set to Active.');
+    }
+}
+
+// ---------------------------------------------------------------
+// Load contract
+// ---------------------------------------------------------------
+$contract = db_query("
+    SELECT c.*,
+           ct.TypeName,
+           cp.CompanyName AS CounterpartyName, cp.CounterpartyCode, cp.TaxCode,
+           cp.LegalRepresentative, cp.Phone AS CounterpartyPhone, cp.Email AS CounterpartyEmail,
+           s.FullName AS OwnerName, s.Position AS OwnerPosition,
+           d.DepartmentName
+    FROM Contract c
+    JOIN ContractType ct ON ct.ContractTypeID = c.ContractTypeID
+    JOIN Counterparty cp ON cp.CounterpartyID = c.CounterpartyID
+    JOIN Staff s         ON s.StaffID         = c.OwnerStaffID
+    JOIN Department d    ON d.DepartmentID    = c.DepartmentID
+    WHERE c.ContractID = ?
+", [$id])->fetch();
+
+if (!$contract) {
+    redirect_with_flash(BASE_URL . '/pages/contracts.php', 'danger', 'Contract not found.');
+}
+
+// External users can only view contracts for their own counterparty
+if ($user['role'] === 'external') {
+    $allowed = db_query(
+        "SELECT 1 FROM Contact WHERE AccountID=? AND CounterpartyID=?",
+        [$user['account_id'], $contract['CounterpartyID']]
+    )->fetchColumn();
+    if (!$allowed) {
+        redirect_with_flash(BASE_URL . '/pages/contracts.php', 'danger', 'Access denied.');
+    }
+}
+
+// ---------------------------------------------------------------
+// Load related data
+// ---------------------------------------------------------------
+$documents = db_query("
+    SELECT doc.*,
+           cv.VersionNumber, cv.FilePath, cv.FileSize, cv.UploadedAt,
+           COALESCE(s.FullName, a.Email) AS UploaderName
+    FROM Document doc
+    LEFT JOIN ContractVersion cv ON cv.DocumentID=doc.DocumentID AND cv.IsCurrent=1
+    LEFT JOIN Account a ON a.AccountID=cv.UploadedBy
+    LEFT JOIN Staff s   ON s.AccountID=cv.UploadedBy
+    WHERE doc.ContractID=? ORDER BY doc.DocumentID
+", [$id])->fetchAll();
+
+$history = db_query("
+    SELECT sh.*, COALESCE(s.FullName, a.Email) AS ActorName
+    FROM StatusHistory sh
+    JOIN Account a ON a.AccountID=sh.ChangedBy
+    LEFT JOIN Staff s ON s.AccountID=sh.ChangedBy
+    WHERE sh.ContractID=? ORDER BY sh.ChangedAt ASC
+", [$id])->fetchAll();
+
+$reviews = db_query("
+    SELECT r.*, COALESCE(s.FullName, a.Email) AS ReviewerName
+    FROM Review r
+    JOIN Account a ON a.AccountID=r.ReviewerAccountID
+    LEFT JOIN Staff s ON s.AccountID=r.ReviewerAccountID
+    WHERE r.ContractID=? ORDER BY r.SubmittedAt DESC
+", [$id])->fetchAll();
+
+$approvals = db_query("
+    SELECT ap.*, COALESCE(s.FullName, a.Email) AS ApproverName
+    FROM Approval ap
+    JOIN Account a ON a.AccountID=ap.ApproverAccountID
+    LEFT JOIN Staff s ON s.AccountID=ap.ApproverAccountID
+    WHERE ap.ContractID=? ORDER BY ap.SubmittedAt DESC
+", [$id])->fetchAll();
+
+// ---------------------------------------------------------------
+// Determine action button visibility
+// ---------------------------------------------------------------
+$owner_account_id = db_query("SELECT AccountID FROM Staff WHERE StaffID=?",
+    [$contract['OwnerStaffID']])->fetchColumn();
+
+$is_owner = (int)$owner_account_id === (int)$user['account_id'];
+
+// Is the current user an assigned pending reviewer for this contract?
+$my_pending_review = db_query(
+    "SELECT ReviewID FROM Review WHERE ContractID=? AND ReviewerAccountID=? AND ReviewStatus='Pending'",
+    [$id, $user['account_id']]
+)->fetch();
+
+// Is there a pending approval for this contract?
+$pending_approval = db_query(
+    "SELECT ApprovalID FROM Approval WHERE ContractID=? AND ApprovalStatus='Pending'",
+    [$id]
+)->fetch();
+
+$show_submit_for_review   = ($is_owner || $user['role'] === 'admin')
+                            && in_array($contract['Status'], ['Draft', 'RevisionRequested']);
+$show_complete_review     = ($my_pending_review || $user['role'] === 'admin')
+                            && $contract['Status'] === 'PendingReview';
+$show_approve_link        = $user['role'] === 'admin'
+                            && in_array($contract['Status'], ['PendingReview', 'PendingApproval']);
+$show_set_active          = $user['role'] === 'admin' && $contract['Status'] === 'Approved';
+
+$page_title  = $contract['ContractCode'];
+$active_nav  = 'contracts';
+$breadcrumbs = [
+    ['label' => 'Contracts', 'url' => BASE_URL . '/pages/contracts.php'],
+    ['label' => $contract['ContractCode']],
+];
+
+include __DIR__ . '/../includes/layout_head.php';
 ?>
 
 <div class="page-header">
@@ -46,7 +290,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
     <?php endif; ?>
 
     <?php if ($show_approve_link): ?>
-    <a href="<?= BASE_URL ?>/pages/approvals.php<?= $pending_approval ? '?act=' . $pending_approval['ApprovalID'] : '?contract_id=' . $contract['ContractID'] ?>"
+    <a href="<?= BASE_URL ?>/pages/approvals.php<?= $pending_approval ? '?act=' . $pending_approval['ApprovalID'] : '?contract_id=' . $id ?>"
        class="btn btn-primary">
       <?= icon_svg('check-circle') ?> Review &amp; Approve
     </a>
@@ -65,7 +309,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
   </div>
 </div>
 
-<?php /* Workflow status hints for internal users */ ?>
+<!-- Workflow status hint for staff -->
 <?php if ($user['role'] !== 'external'): ?>
 <?php if ($contract['Status'] === 'Draft' && $is_owner): ?>
 <div class="alert alert-info" style="margin-bottom:16px;">
@@ -185,25 +429,11 @@ include __DIR__ . '/../../../includes/layout_head.php';
     <div class="card">
       <div class="card-header">
         <span class="card-title">Documents</span>
-        <div style="display:flex;align-items:center;gap:10px;">
-          <span style="font-size:12px;color:var(--color-text-muted);"><?= count($documents) ?> file<?= count($documents) !== 1 ? 's' : '' ?></span>
-          <?php if ($user['role'] !== 'external'): ?>
-          <a href="<?= BASE_URL ?>/pages/upload_document.php?contract_id=<?= $contract['ContractID'] ?>"
-             class="btn btn-primary btn-sm">
-            <?= icon_svg('upload') ?> Upload
-          </a>
-          <?php endif; ?>
-        </div>
+        <span style="font-size:12px;color:var(--color-text-muted);"><?= count($documents) ?> file<?= count($documents) !== 1 ? 's' : '' ?></span>
       </div>
       <?php if (empty($documents)): ?>
       <div class="card-body" style="text-align:center;padding:32px;color:var(--color-text-muted);font-size:13px;">
-        <p>No documents attached to this contract.</p>
-        <?php if ($user['role'] !== 'external'): ?>
-        <a href="<?= BASE_URL ?>/pages/upload_document.php?contract_id=<?= $contract['ContractID'] ?>"
-           class="btn btn-primary btn-sm" style="margin-top:12px;">
-          <?= icon_svg('upload') ?> Upload First Document
-        </a>
-        <?php endif; ?>
+        No documents attached to this contract.
       </div>
       <?php else: ?>
       <div class="card-body" style="padding:12px 20px;">
@@ -216,11 +446,9 @@ include __DIR__ . '/../../../includes/layout_head.php';
           <div style="flex:1;min-width:0;">
             <div style="font-size:13px;font-weight:600;"><?= e($doc['DocumentName']) ?></div>
             <div class="td-meta">
-              <?= e(str_replace(
-                ['MainContract','Appendix','CargoInsurance','FoodSafetyCert','BankGuarantee','Other'],
+              <?= e(str_replace(['MainContract','Appendix','CargoInsurance','FoodSafetyCert','BankGuarantee','Other'],
                 ['Main Contract','Appendix','Cargo Insurance','Food Safety Cert','Bank Guarantee','Other'],
-                $doc['DocumentType']
-              )) ?>
+                $doc['DocumentType'])) ?>
               <?php if ($doc['VersionNumber']): ?> · v<?= $doc['VersionNumber'] ?><?php endif; ?>
               <?php if ($doc['FileSize']): ?> · <?= number_format($doc['FileSize']/1024, 1) ?> KB<?php endif; ?>
               <?php if ($doc['IsVisibleToPartner']): ?>
@@ -228,19 +456,13 @@ include __DIR__ . '/../../../includes/layout_head.php';
               <?php endif; ?>
             </div>
           </div>
-          <?php if ($doc['FilePath'] ?? null): ?>
-          <a href="<?= BASE_URL ?>/pages/download_document.php?doc=<?= $doc['DocumentID'] ?>"
-             class="btn btn-ghost btn-sm" title="Download">
-            <?= icon_svg('download') ?>
-          </a>
-          <?php endif; ?>
         </div>
         <?php endforeach; ?>
       </div>
       <?php endif; ?>
     </div>
 
-    <!-- Legal Reviews -->
+    <!-- Reviews -->
     <?php if (!empty($reviews)): ?>
     <div class="card">
       <div class="card-header"><span class="card-title">Legal Reviews</span></div>
@@ -264,7 +486,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
     </div>
     <?php endif; ?>
 
-    <!-- Approval Records -->
+    <!-- Approvals -->
     <?php if (!empty($approvals)): ?>
     <div class="card">
       <div class="card-header"><span class="card-title">Approval Records</span></div>
@@ -333,7 +555,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
 
         <?php if ($show_approve_link): ?>
         <div class="divider" style="margin:12px 0;"></div>
-        <a href="<?= BASE_URL ?>/pages/approvals.php<?= $pending_approval ? '?act=' . $pending_approval['ApprovalID'] : '?contract_id=' . $contract['ContractID'] ?>"
+        <a href="<?= BASE_URL ?>/pages/approvals.php<?= $pending_approval ? '?act=' . $pending_approval['ApprovalID'] : '?contract_id=' . $id ?>"
            class="btn btn-primary" style="width:100%;justify-content:center;">
           <?= icon_svg('check-circle') ?> Review This Contract
         </a>
@@ -358,7 +580,9 @@ include __DIR__ . '/../../../includes/layout_head.php';
       <div class="card-header"><span class="card-title">Status History</span></div>
       <div class="card-body" style="padding:16px;">
         <?php if (empty($history)): ?>
-        <p style="font-size:13px;color:var(--color-text-muted);text-align:center;padding:12px 0;">No history available.</p>
+        <p style="font-size:13px;color:var(--color-text-muted);text-align:center;padding:12px 0;">
+          No history available.
+        </p>
         <?php else: ?>
         <ul class="timeline">
           <?php foreach ($history as $h): ?>
@@ -386,7 +610,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
 
 </div>
 
-<?php /* Review completion modal (for Legal reviewer / Admin) */ ?>
+<!-- Review completion modal (for Legal reviewer / Admin) -->
 <?php if ($show_complete_review): ?>
 <div id="reviewModal" style="display:none;position:fixed;inset:0;z-index:1000;
      background:rgba(0,0,0,.45);align-items:center;justify-content:center;">
@@ -397,7 +621,7 @@ include __DIR__ . '/../../../includes/layout_head.php';
     <form method="POST" action="<?= BASE_URL ?>/pages/approvals.php" id="reviewModalForm">
       <?= csrf_field() ?>
       <input type="hidden" name="post_action" value="complete_review">
-      <input type="hidden" name="review_id" id="reviewModalId" value="">
+      <input type="hidden" name="review_id"   id="reviewModalId" value="">
       <div class="form-group" style="margin-bottom:16px;">
         <label style="font-weight:600;display:block;margin-bottom:8px;">Decision <span class="req">*</span></label>
         <div style="display:flex;flex-direction:column;gap:8px;">
@@ -453,4 +677,4 @@ document.getElementById('reviewModalForm').addEventListener('submit', function(e
 </script>
 <?php endif; ?>
 
-<?php include __DIR__ . '/../../../includes/layout_foot.php'; ?>
+<?php include __DIR__ . '/../includes/layout_foot.php'; ?>
